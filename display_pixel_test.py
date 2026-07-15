@@ -6,7 +6,6 @@ import sounddevice as sd
 import speech_recognition as sr
 import openwakeword
 from openwakeword.model import Model
-import winsound
 import time
 
 # ─────────────────────────────────────────────
@@ -34,6 +33,32 @@ Example Output format:
 }}
 Do not include any extra text outside the JSON object.
 """
+
+# ─────────────────────────────────────────────
+# CROSS-PLATFORM BEEP (MAC COMPATIBLE)
+# ─────────────────────────────────────────────
+
+def play_beep(frequency, duration_ms):
+    """Generates and plays a sine wave beep using sounddevice."""
+    sample_rate = 44100
+    duration_sec = duration_ms / 1000.0
+    t = np.linspace(0, duration_sec, int(sample_rate * duration_sec), False)
+    # Generate a comfortable sine wave tone
+    wave = np.sin(frequency * t * 2 * np.pi)
+    # Smooth the start and end slightly to prevent harsh clicking sounds
+    fade = int(sample_rate * 0.01)  # 10ms fade
+    fade_window = np.ones(len(wave))
+    fade_window[:fade] = np.linspace(0, 1, fade)
+    fade_window[-fade:] = np.linspace(1, 0, fade)
+    wave = wave * fade_window
+    
+    # Play the audio and block until it finishes
+    sd.play(wave.astype(np.float32), sample_rate)
+    sd.wait()
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
 
 def extract_json_objects(text: str):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -100,37 +125,6 @@ def clear_matrix():
 if __name__ == "__main__":
     chat_history = []
     recognizer = sr.Recognizer()
-
-    import threading
-    from datetime import datetime
-
-    TIME_URL = f"http://{MATRIX_IP}/time"
-
-   def clock_updater():
-    last_minute = -1
-
-    while True:
-        try:
-            now = datetime.now()
-
-            if now.minute != last_minute:
-                requests.post(
-                    TIME_URL,
-                    json={
-                        "hour": now.hour,
-                        "minute": now.minute
-                    },
-                    timeout=5
-                )
-
-                last_minute = now.minute
-
-        except Exception as e:
-            print("[Time update error]", e)
-
-        time.sleep(1)
-
-    threading.Thread(target=clock_updater, daemon=True).start()
         
     print("Initializing Jarvis wake word engine...")
     openwakeword.utils.download_models() 
@@ -153,7 +147,7 @@ if __name__ == "__main__":
         audio_buffer.append(indata.copy())
         last_callback_time = time.time()
 
-    # Start streaming audio from your ReSpeaker mic
+    # Start streaming audio from your microphone
     with sd.InputStream(samplerate=FORMAT_SAMPLE_RATE, channels=1, dtype='int16', 
                         blocksize=CHUNK_SIZE, callback=audio_callback):
         while True:
@@ -175,8 +169,9 @@ if __name__ == "__main__":
                 if prediction.get("jarvis", 0) > 0.6:
                     print("\n✨ [Wake Word Detected: Jarvis!]")
                     
-                    winsound.Beep(1500, 80)
-                    winsound.Beep(2000, 80)
+                    # Custom Mac-friendly beep sound effect
+                    play_beep(1500, 80)
+                    play_beep(2000, 80)
                     
                     print("Listening for your command...")
                     DURATION = 5
