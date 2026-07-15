@@ -106,11 +106,14 @@ if __name__ == "__main__":
 
     TIME_URL = f"http://{MATRIX_IP}/time"
 
-    def clock_updater():
-        while True:
-            try:
-                now = datetime.now()
+   def clock_updater():
+    last_minute = -1
 
+    while True:
+        try:
+            now = datetime.now()
+
+            if now.minute != last_minute:
                 requests.post(
                     TIME_URL,
                     json={
@@ -120,10 +123,12 @@ if __name__ == "__main__":
                     timeout=5
                 )
 
-            except Exception as e:
-                print("[Time update error]", e)
+                last_minute = now.minute
 
-            time.sleep(30)
+        except Exception as e:
+            print("[Time update error]", e)
+
+        time.sleep(1)
 
     threading.Thread(target=clock_updater, daemon=True).start()
         
