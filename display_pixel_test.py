@@ -18,7 +18,7 @@ PRESET_URL = f"http://{MATRIX_IP}/preset"
 CLEAR_URL  = f"http://{MATRIX_IP}/clear"
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
-MODEL_NAME = "liquid/lfm2.5-1.2b"
+MODEL_NAME = "google/gemma-4-e4b"
 
 PRESETS = ["idle", "recording", "mute", "unmute", "deafen", "undeafen", "lights_on", "lights_off", "camera", "dnd", "available", "away"]
 AVAILABLE_PRESETS = ", ".join(PRESETS)
@@ -100,11 +100,37 @@ def clear_matrix():
 if __name__ == "__main__":
     chat_history = []
     recognizer = sr.Recognizer()
-    
+
+    import threading
+    from datetime import datetime
+
+    TIME_URL = f"http://{MATRIX_IP}/time"
+
+    def clock_updater():
+        while True:
+            try:
+                now = datetime.now()
+
+                requests.post(
+                    TIME_URL,
+                    json={
+                        "hour": now.hour,
+                        "minute": now.minute
+                    },
+                    timeout=5
+                )
+
+            except Exception as e:
+                print("[Time update error]", e)
+
+            time.sleep(30)
+
+    threading.Thread(target=clock_updater, daemon=True).start()
+        
     print("Initializing Jarvis wake word engine...")
     openwakeword.utils.download_models() 
     
-    oww_model = Model(wakeword_models=["blue"], inference_framework="onnx")
+    oww_model = Model(wakeword_models=["jarvis"], inference_framework="onnx")
     
     FORMAT_SAMPLE_RATE = 16000 
     CHUNK_SIZE = 1280  
