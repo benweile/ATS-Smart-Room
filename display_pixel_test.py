@@ -1,23 +1,25 @@
 import json
 import re
+import sys
 import requests
 import numpy as np
 import sounddevice as sd
-import speech_recognition as sr
-import openwakeword
-from openwakeword.model import Model
 import time
+import whisper
+import difflib
+import queue
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 
-MATRIX_IP = "172.20.10.9"
+MATRIX_IP = "192.168.2.2"
 PRESET_URL = f"http://{MATRIX_IP}/preset"
 CLEAR_URL  = f"http://{MATRIX_IP}/clear"
+MATRIX_TIMEOUT = (10, 15) 
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
-MODEL_NAME = "google/gemma-4-e4b"
+MODEL_NAME = "nvidia/nemotron-3-nano-4b"
 
 PRESETS = ["idle", "recording", "mute", "unmute", "deafen", "undeafen", "lights_on", "lights_off", "camera", "dnd", "available", "away"]
 AVAILABLE_PRESETS = ", ".join(PRESETS)
@@ -26,184 +28,245 @@ SYSTEM_PROMPT = f"""
 You are a helpful AI assistant connected to an LED matrix display.
 You MUST return a valid JSON object containing exactly two keys: "reply" and "preset".
 Available presets you can choose from: [{AVAILABLE_PRESETS}]
-Example Output format:
-{{
-  "reply": "I am turning on the recording light now.",
-  "preset": "recording"
-}}
 Do not include any extra text outside the JSON object.
 """
 
+# --- HARDWARE ROUTING CONFIG ---
+INPUT_DEVICE_INDEX = 1   # reSpeaker XVF3800 4-Mic Array
+OUTPUT_DEVICE_INDEX = 2  # Mac mini Speakers
+SAMPLE_RATE = 16000      # Whisper optimal rate
+AUDIO_CHANNELS = 1       # Mono stream
+WHISPER_MODEL_SIZE = "large-v3-turbo"
+
+# --- NEW TRIGGER SETTINGS ---
+TARGET_WAKE_WORD = "blue"
+FUZZY_MATCH_THRESHOLD = 0.80  # Forgiving phonetic score threshold
+
+print("🧠 Loading Whisper Model...")
+whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+print("✅ Whisper Loaded.")
+
+# Thread-safe queue for raw audio blocks
+audio_queue = queue.Queue()
+
+def audio_callback(indata, frames, time_info, status):
+    if status:
+        print(f"⚠️ Audio Status: {status}", file=sys.stderr)
+    audio_queue.put(indata.copy())
+
 # ─────────────────────────────────────────────
-# CROSS-PLATFORM BEEP (MAC COMPATIBLE)
+# HARDWARE AUDIO UTILITIES
 # ─────────────────────────────────────────────
 
 def play_beep(frequency, duration_ms):
-    """Generates and plays a sine wave beep using sounddevice."""
-    sample_rate = 44100
-    duration_sec = duration_ms / 1000.0
-    t = np.linspace(0, duration_sec, int(sample_rate * duration_sec), False)
-    # Generate a comfortable sine wave tone
-    wave = np.sin(frequency * t * 2 * np.pi)
-    # Smooth the start and end slightly to prevent harsh clicking sounds
-    fade = int(sample_rate * 0.01)  # 10ms fade
-    fade_window = np.ones(len(wave))
-    fade_window[:fade] = np.linspace(0, 1, fade)
-    fade_window[-fade:] = np.linspace(1, 0, fade)
-    wave = wave * fade_window
-    
-    # Play the audio and block until it finishes
-    sd.play(wave.astype(np.float32), sample_rate)
-    sd.wait()
+    try:
+        sample_rate = 44100
+        duration_sec = duration_ms / 1000.0
+        t = np.linspace(0, duration_sec, int(sample_rate * duration_sec), False)
+        wave = np.sin(frequency * t * 2 * np.pi)
+        
+        fade = int(sample_rate * 0.01)
+        fade_window = np.ones(len(wave))
+        fade_window[:fade] = np.linspace(0, 1, fade)
+        fade_window[-fade:] = np.linspace(1, 0, fade)
+        wave = wave * fade_window
+        
+        sd.play(wave.astype(np.float32), sample_rate, device=OUTPUT_DEVICE_INDEX)
+        sd.wait()
+    except Exception:
+        pass
+
+def transcribe_audio_hyper_sensitive(audio_data):
+    audio_fp32 = audio_data.flatten().astype(np.float32) / 32768.0
+    result = whisper_model.transcribe(
+        audio_fp32, 
+        fp16=False,
+        language="en",
+        temperature=0.0,
+        no_speech_threshold=0.01,
+        logprob_threshold=-3.0,
+        suppress_tokens=""
+    )
+    return result["text"].strip()
+
+def transcribe_audio_normal(audio_data):
+    audio_fp32 = audio_data.flatten().astype(np.float32) / 32768.0
+    result = whisper_model.transcribe(audio_fp32, fp16=False, language="en")
+    return result["text"].strip()
 
 # ─────────────────────────────────────────────
-# HELPERS
+# CONTROL & DATA LOGIC
 # ─────────────────────────────────────────────
+
+def wait_for_matrix_connection():
+    print("\n" + "═"*50)
+    print(f"🔌 Initializing connection to LED Matrix ({MATRIX_IP})...")
+    print("═"*50 + "\n")
+    attempt = 1
+    while True:
+        try:
+            r = requests.get(CLEAR_URL, headers={"Connection": "close"}, timeout=(3, 5))
+            if r.status_code == 200:
+                print(f"\n✅ Connection established successfully!")
+                play_beep(1000, 150)
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        print(f"   [Attempt {attempt}] Matrix is offline. Retrying...")
+        attempt += 1
+        time.sleep(3)
 
 def extract_json_objects(text: str):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError("No JSON found")
-    clean = re.sub(r"//.*", "", match.group(0))
-    return json.loads(clean)
+    return json.loads(re.sub(r"//.*", "", match.group(0)))
 
 def chat_turn(history, user_input):
     history.append({"role": "user", "content": user_input})
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-
-    r = requests.post(
-        LM_STUDIO_URL,
-        json={
-            "model": MODEL_NAME,
-            "messages": messages,
-            "temperature": 0.3,
-            "stream": False
-        },
-        timeout=200
-    )
+    r = requests.post(LM_STUDIO_URL, json={"model": MODEL_NAME, "messages": messages, "temperature": 0.3, "stream": False}, timeout=200)
     r.raise_for_status()
-    resp = r.json()
-    raw_content = resp["choices"][0]["message"]["content"].strip()
-
+    raw_content = r.json()["choices"][0]["message"]["content"].strip()
     try:
         parsed = extract_json_objects(raw_content)
         bot_reply = parsed.get("reply", "...")
         chosen_preset = parsed.get("preset", "idle")
     except Exception:
-        print("\n[Parse failed]\n", raw_content)
         bot_reply = "I couldn't format that response properly."
         chosen_preset = "idle"
-
-    history.append({
-        "role": "assistant",
-        "content": json.dumps({"reply": bot_reply, "preset": chosen_preset})
-    })
-
+    history.append({"role": "assistant", "content": json.dumps({"reply": bot_reply, "preset": chosen_preset})})
     return bot_reply, chosen_preset
 
 def send_preset(preset_name):
-    if preset_name not in PRESETS:
-        return
+    if preset_name not in PRESETS: return
     try:
-        requests.post(PRESET_URL, json={"preset": preset_name}, timeout=5)
-        print(f"[LED Matrix -> {preset_name}]")
+        r = requests.post(PRESET_URL, json={"preset": preset_name}, headers={"Connection": "close"}, timeout=MATRIX_TIMEOUT)
+        print(f"[LED Matrix -> {preset_name}] HTTP {r.status_code}")
     except Exception as e:
-        print("[Matrix error]", e)
-
-def clear_matrix():
-    try:
-        requests.get(CLEAR_URL, timeout=5)
-        print("[Matrix cleared]")
-    except Exception as e:
-        print("[Matrix error]", e)
+        print(f"[Matrix transmission failed]: {e}")
 
 # ─────────────────────────────────────────────
-# MAIN STREAM & WAKE WORD PIPELINE
+# THREAD-SAFE STREAMING INTERACTIVE LOOP
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    try:
+        wait_for_matrix_connection()
+    except KeyboardInterrupt:
+        sys.exit(0)
+
     chat_history = []
-    recognizer = sr.Recognizer()
-        
-    print("Initializing Jarvis wake word engine...")
-    openwakeword.utils.download_models() 
-    
-    oww_model = Model(wakeword_models=["jarvis"], inference_framework="onnx")
-    
-    FORMAT_SAMPLE_RATE = 16000 
-    CHUNK_SIZE = 1280  
-    
-    print("\n🤖 Jarvis LED Matrix System Active.")
-    print("Say 'Jarvis' out loud to trigger the AI...\n")
+    print("="*50)
+    print("🤖 ASYNCHRONOUS THREADED VOICE ENGINE.")
+    print(f"Trigger word configured to: '{TARGET_WAKE_WORD}'")
+    print("="*50 + "\n")
 
-    audio_buffer = []
-    last_callback_time = time.time()
+    WINDOW_DURATION = 2.5  
+    window_samples = int(WINDOW_DURATION * SAMPLE_RATE)
+    audio_buffer = np.zeros((window_samples, 1), dtype=np.int16)
 
-    def audio_callback(indata, frames, time_info, status):
-        global last_callback_time
-        if status:
-            print(f"[Stream Status Warning]: {status}")
-        audio_buffer.append(indata.copy())
-        last_callback_time = time.time()
-
-    # Start streaming audio from your microphone
-    with sd.InputStream(samplerate=FORMAT_SAMPLE_RATE, channels=1, dtype='int16', 
-                        blocksize=CHUNK_SIZE, callback=audio_callback):
+    stream = sd.InputStream(
+        device=INPUT_DEVICE_INDEX,
+        channels=AUDIO_CHANNELS,
+        samplerate=SAMPLE_RATE,
+        dtype='int16',
+        callback=audio_callback,
+        blocksize=4000  
+    )
+    
+    with stream:
+        print(f"👂 Listening continuously for the word '{TARGET_WAKE_WORD}'...")
         while True:
-            # 🛡️ STREAM GUARD: If the hardware stream goes silent/stalls for over 3 seconds, flush it
-            if time.time() - last_callback_time > 3.0:
-                if len(audio_buffer) > 0:
-                    audio_buffer.clear()
-                    oww_model.reset()
-
-            # Prevent buffer buildup backlog from running away if processing falls behind
-            if len(audio_buffer) > 20: 
-                # Keep only the newest chunks so we don't lag behind real-time speech
-                audio_buffer = audio_buffer[-5:]
-
-            if len(audio_buffer) > 0:
-                chunk = audio_buffer.pop(0).flatten()
-                prediction = oww_model.predict(chunk)
+            try:
+                data_blocks = []
+                while not audio_queue.empty():
+                    data_blocks.append(audio_queue.get_nowait())
                 
-                if prediction.get("jarvis", 0) > 0.6:
-                    print("\n✨ [Wake Word Detected: Jarvis!]")
+                if not data_blocks:
+                    time.sleep(0.1)
+                    continue
+                
+                new_data = np.concatenate(data_blocks, axis=0)
+                
+                # Apply aggressive far-field microphone array gain
+                new_data_boosted = np.clip(new_data.astype(np.float32) * 6.0, -32768.0, 32767.0).astype(np.int16)
+                
+                num_new_samples = len(new_data_boosted)
+                if num_new_samples >= window_samples:
+                    audio_buffer = new_data_boosted[-window_samples:]
+                else:
+                    audio_buffer = np.roll(audio_buffer, -num_new_samples, axis=0)
+                    audio_buffer[-num_new_samples:] = new_data_boosted
+                
+                raw_text = transcribe_audio_hyper_sensitive(audio_buffer).lower().strip(".,!? ")
+                if not raw_text:
+                    continue
+                
+                words_heard = raw_text.split()
+                highest_match_score = 0.0
+                best_matching_word = ""
+                
+                for word in words_heard:
+                    score = difflib.SequenceMatcher(None, word, TARGET_WAKE_WORD).ratio()
+                    if score > highest_match_score:
+                        highest_match_score = score
+                        best_matching_word = word
+                
+                if highest_match_score >= FUZZY_MATCH_THRESHOLD:
+                    print(f"\n🎯 Triggered! (Heard: '{best_matching_word}' | Match Score: {highest_match_score*100:.1f}%)")
                     
-                    # Custom Mac-friendly beep sound effect
-                    play_beep(1500, 80)
-                    play_beep(2000, 80)
+                    play_beep(1200, 70)
+                    time.sleep(0.02)
+                    play_beep(1500, 70)
                     
-                    print("Listening for your command...")
-                    DURATION = 5
-                    command_audio = sd.rec(int(DURATION * FORMAT_SAMPLE_RATE), 
-                                           samplerate=FORMAT_SAMPLE_RATE, 
-                                           channels=1, dtype='int16')
-                    sd.wait() 
-                    print("Processing prompt...")
+                    with audio_queue.mutex:
+                        audio_queue.queue.clear()
                     
-                    try:
-                        audio_bytes = command_audio.tobytes()
-                        audio_data = sr.AudioData(audio_bytes, FORMAT_SAMPLE_RATE, sample_width=2)
+                    print("🎤 Listening for your command...")
+                    
+                    command_samples_needed = int(6.0 * SAMPLE_RATE)
+                    command_blocks = []
+                    samples_collected = 0
+                    
+                    start_time = time.time()
+                    while samples_collected < command_samples_needed:
+                        if time.time() - start_time > 8.0:
+                            break
+                        try:
+                            block = audio_queue.get(timeout=0.5)
+                            command_blocks.append(block)
+                            samples_collected += len(block)
+                        except queue.Empty:
+                            continue
+                    
+                    if command_blocks:
+                        command_audio = np.concatenate(command_blocks, axis=0)
+                        command_audio = np.clip(command_audio.astype(np.float32) * 3.5, -32768.0, 32767.0).astype(np.int16)
                         
-                        user_msg = recognizer.recognize_google(audio_data).strip()
-                        print(f"You said: {user_msg}")
+                        clean_command = transcribe_audio_normal(command_audio).strip()
+                        print(f"📋 Parsed Command: '{clean_command}'")
                         
-                        if user_msg.lower() == "clear":
-                            clear_matrix()
-                        else:
-                            reply, preset = chat_turn(chat_history, user_msg)
-                            print(f"Jarvis: {reply}")
+                        if clean_command and len(clean_command) >= 2:
+                            print("🧠 Querying Local LLM...")
+                            reply, preset = chat_turn(chat_history, clean_command)
+                            
+                            play_beep(1400, 100)
+                            print(f"\nJarvis: {reply}")
                             send_preset(preset)
-                        
-                    except sr.UnknownValueError:
-                        print("[System did not understand the audio command]")
-                    except Exception as e:
-                        print(f"[Processing Error]: {e}")
+                            print("-" * 50 + "\n")
+                        else:
+                            print("❌ Command empty. Returning to standby.\n")
                     
-                    print("\nResetting wake-word listener...")
-                    audio_buffer.clear()
-                    oww_model.reset()
-                    print("Listening for 'Jarvis'...")
-            else:
-                # Keep CPU usage tiny while waiting for data chunks
-                time.sleep(0.01)
+                    audio_buffer.fill(0)
+                    with audio_queue.mutex:
+                        audio_queue.queue.clear()
+                    print(f"👂 Resuming monitoring for '{TARGET_WAKE_WORD}'...")
+
+            except KeyboardInterrupt:
+                print("\nShutting down hardware audio stream threads.")
+                break
+            except Exception as e:
+                print(f"\n[Loop Error]: {e}\n")
+                time.sleep(1)
