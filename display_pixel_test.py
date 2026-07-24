@@ -2,9 +2,12 @@ import json
 import re
 import sys
 import io
+import os
 import wave
 import threading
 import logging
+import subprocess
+import tempfile
 
 import requests
 import numpy as np
@@ -14,7 +17,7 @@ import whisper
 import difflib
 import queue
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -135,6 +138,40 @@ def _transcribe_upload():
     text = result["text"].strip()
     print(f"⌚ Watch heard: {text!r}")
     return jsonify({"text": text})
+
+@stt_app.post("/tts")
+def _tts():
+    # The watch sends {"text": "..."} and expects a 16 kHz mono 16-bit WAV back.
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "no text"}), 400
+
+    aiff_path = wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as a:
+            aiff_path = a.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as w:
+            wav_path = w.name
+
+        # macOS built-in speech synth -> AIFF, then convert to the watch's format.
+        subprocess.run(["say", "-o", aiff_path, text], check=True)
+        subprocess.run(
+            ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", aiff_path, wav_path],
+            check=True,
+        )
+        with open(wav_path, "rb") as f:
+            audio = f.read()
+    except Exception as e:
+        print(f"[TTS failed]: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        for p in (aiff_path, wav_path):
+            if p and os.path.exists(p):
+                os.remove(p)
+
+    print(f"🔊 Spoke {len(audio)} bytes for: {text!r}")
+    return Response(audio, mimetype="audio/wav")
 
 def start_stt_server():
     def _run():
